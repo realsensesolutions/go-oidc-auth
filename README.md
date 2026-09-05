@@ -72,3 +72,9 @@ use loopback hosts.
 `Verify` checks issuer, audience, signature, and expiry through the discovered
 provider. The callback also verifies the transaction state, PKCE verifier, and
 ID-token nonce before creating a session.
+
+Provider response bodies and low-level discovery, token-exchange, verification,
+and logout errors are never written to the configured logger or passed to an
+`ErrorHandler`. Consumers receive stable errors that can be matched with
+`errors.Is`: `ErrInvalidRequest`, `ErrAuthenticationFailed`, `ErrUnauthorized`,
+`ErrProviderUnavailable`, and `ErrEmailNotVerified`.

@@ -3,7 +3,6 @@ package oidcauth
 import (
 	"crypto/subtle"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -52,7 +51,7 @@ func (a *Authenticator) LoginHandler(w http.ResponseWriter, r *http.Request) {
 func (a *Authenticator) CallbackHandler(w http.ResponseWriter, r *http.Request) {
 	if providerError := strings.TrimSpace(r.URL.Query().Get("error")); providerError != "" {
 		a.clearTransactionCookie(w)
-		a.writeError(w, r, http.StatusBadRequest, errorCodeAuthentication, fmt.Errorf("provider returned %s", providerError))
+		a.writeError(w, r, http.StatusBadRequest, errorCodeAuthentication, ErrAuthenticationFailed)
 		return
 	}
 	code := strings.TrimSpace(r.URL.Query().Get("code"))
@@ -63,7 +62,7 @@ func (a *Authenticator) CallbackHandler(w http.ResponseWriter, r *http.Request) 
 	}
 	cookie, err := r.Cookie(a.config.TransactionCookie.Name)
 	if err != nil {
-		a.writeError(w, r, http.StatusBadRequest, errorCodeInvalidRequest, errors.New("authentication transaction cookie is missing"))
+		a.writeError(w, r, http.StatusBadRequest, errorCodeInvalidRequest, errTransactionCookieMissing)
 		return
 	}
 	value, err := decryptTransaction(a.config.StateEncryptionKey, cookie.Value, a.clock())
@@ -84,7 +83,7 @@ func (a *Authenticator) CallbackHandler(w http.ResponseWriter, r *http.Request) 
 	ctx := a.providerContext(r.Context())
 	token, err := provider.oauth2Config.Exchange(ctx, code, oauth2.SetAuthURLParam("code_verifier", value.CodeVerifier))
 	if err != nil {
-		a.writeError(w, r, http.StatusBadRequest, errorCodeAuthentication, fmt.Errorf("exchange authorization code: %w", err))
+		a.writeError(w, r, http.StatusBadRequest, errorCodeAuthentication, ErrAuthenticationFailed)
 		return
 	}
 	rawIDToken, ok := token.Extra("id_token").(string)
@@ -119,13 +118,13 @@ func (a *Authenticator) LogoutHandler(w http.ResponseWriter, r *http.Request) {
 	a.clearSessionCookie(w)
 	provider, providerErr := a.providerState(r.Context())
 	if providerErr != nil {
-		a.config.Logger.WarnContext(r.Context(), "OIDC logout discovery failed; local session was cleared", "error", providerErr)
+		a.config.Logger.WarnContext(r.Context(), "OIDC logout discovery failed; local session was cleared", "error_class", ErrProviderUnavailable.Error())
 		http.Redirect(w, r, redirectURL, http.StatusFound)
 		return
 	}
 	logoutURL, err := a.logoutURL(provider.endSessionURL, idTokenHint, redirectURL)
 	if err != nil {
-		a.config.Logger.WarnContext(r.Context(), "OIDC logout URL could not be built; local session was cleared", "error", err)
+		a.config.Logger.WarnContext(r.Context(), "OIDC logout URL could not be built; local session was cleared", "error_class", ErrAuthenticationFailed.Error())
 		http.Redirect(w, r, redirectURL, http.StatusFound)
 		return
 	}
@@ -199,6 +198,7 @@ func (a *Authenticator) clearSessionCookie(w http.ResponseWriter) {
 }
 
 func (a *Authenticator) writeError(w http.ResponseWriter, r *http.Request, status int, code string, err error) {
-	a.config.Logger.WarnContext(r.Context(), "OIDC request failed", "code", code, "status", status, "error", err)
-	a.config.ErrorHandler(w, r, status, code, err)
+	safeErr := sanitizeError(code, err)
+	a.config.Logger.WarnContext(r.Context(), "OIDC request failed", "code", code, "status", status, "error_class", safeErr.Error())
+	a.config.ErrorHandler(w, r, status, code, safeErr)
 }

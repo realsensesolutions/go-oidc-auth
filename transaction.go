@@ -7,7 +7,6 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -66,29 +65,29 @@ func encryptTransaction(key []byte, value transaction) (string, error) {
 func decryptTransaction(key []byte, encoded string, now time.Time) (transaction, error) {
 	ciphertext, err := base64.RawURLEncoding.DecodeString(encoded)
 	if err != nil {
-		return transaction{}, errors.New("transaction cookie is malformed")
+		return transaction{}, errTransactionCookieMalformed
 	}
 	aead, err := newAEAD(key)
 	if err != nil {
 		return transaction{}, err
 	}
 	if len(ciphertext) <= aead.NonceSize() {
-		return transaction{}, errors.New("transaction cookie is malformed")
+		return transaction{}, errTransactionCookieMalformed
 	}
 	nonce, ciphertext := ciphertext[:aead.NonceSize()], ciphertext[aead.NonceSize():]
 	plaintext, err := aead.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
-		return transaction{}, errors.New("transaction cookie is invalid")
+		return transaction{}, errTransactionCookieInvalid
 	}
 	var value transaction
 	if err := json.Unmarshal(plaintext, &value); err != nil {
-		return transaction{}, errors.New("transaction cookie is malformed")
+		return transaction{}, errTransactionCookieMalformed
 	}
 	if value.State == "" || value.Nonce == "" || value.CodeVerifier == "" || value.RedirectURL == "" {
-		return transaction{}, errors.New("transaction cookie is incomplete")
+		return transaction{}, errTransactionCookieIncomplete
 	}
 	if value.ExpiresAt.IsZero() || !now.Before(value.ExpiresAt) {
-		return transaction{}, errors.New("transaction cookie has expired")
+		return transaction{}, errTransactionCookieExpired
 	}
 	return value, nil
 }

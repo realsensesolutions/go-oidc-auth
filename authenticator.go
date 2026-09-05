@@ -61,9 +61,13 @@ func (a *Authenticator) Verify(ctx context.Context, rawIDToken string) (Session,
 	ctx = a.providerContext(ctx)
 	idToken, err := state.verifier.Verify(ctx, rawIDToken)
 	if err != nil {
-		return Session{}, fmt.Errorf("verify ID token: %w", err)
+		return Session{}, ErrAuthenticationFailed
 	}
-	return a.sessionFromToken(idToken, rawIDToken)
+	session, err := a.sessionFromToken(idToken, rawIDToken)
+	if err != nil {
+		return Session{}, sanitizeError(errorCodeAuthentication, err)
+	}
+	return session, nil
 }
 
 // Ready verifies OIDC discovery and that the provider's JWKS is reachable.
@@ -74,26 +78,26 @@ func (a *Authenticator) Ready(ctx context.Context) error {
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, state.jwksURL, nil)
 	if err != nil {
-		return fmt.Errorf("create JWKS readiness request: %w", err)
+		return ErrProviderUnavailable
 	}
 	response, err := a.config.HTTPClient.Do(request)
 	if err != nil {
-		return fmt.Errorf("request provider JWKS: %w", err)
+		return ErrProviderUnavailable
 	}
 	defer response.Body.Close()
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
-		return fmt.Errorf("provider JWKS returned status %d", response.StatusCode)
+		return ErrProviderUnavailable
 	}
 	var document struct {
 		Keys []json.RawMessage `json:"keys"`
 	}
 	decoder := json.NewDecoder(io.LimitReader(response.Body, 1<<20))
 	if err := decoder.Decode(&document); err != nil {
-		return fmt.Errorf("decode provider JWKS: %w", err)
+		return ErrProviderUnavailable
 	}
 	if len(document.Keys) == 0 {
-		return errors.New("provider JWKS contains no keys")
+		return ErrProviderUnavailable
 	}
 	return nil
 }
@@ -106,14 +110,14 @@ func (a *Authenticator) providerState(ctx context.Context) (*providerState, erro
 	}
 	provider, err := oidc.NewProvider(a.providerContext(ctx), a.config.IssuerURL)
 	if err != nil {
-		return nil, fmt.Errorf("discover OIDC provider: %w", err)
+		return nil, ErrProviderUnavailable
 	}
 	var metadata providerMetadata
 	if err := provider.Claims(&metadata); err != nil {
-		return nil, fmt.Errorf("decode OIDC provider metadata: %w", err)
+		return nil, ErrProviderUnavailable
 	}
 	if metadata.JWKSURI == "" {
-		return nil, errors.New("OIDC provider metadata does not contain jwks_uri")
+		return nil, ErrProviderUnavailable
 	}
 	endpoint := provider.Endpoint()
 	state := &providerState{

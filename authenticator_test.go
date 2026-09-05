@@ -1,13 +1,16 @@
 package oidcauth
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -27,6 +30,9 @@ type fakeProvider struct {
 	codeVerifier string
 	tokenCalls   int
 	jwksStatus   int
+	tokenStatus  int
+	tokenBody    string
+	idToken      string
 }
 
 func newFakeProvider(t *testing.T) *fakeProvider {
@@ -76,7 +82,15 @@ func (p *fakeProvider) serveToken(w http.ResponseWriter, r *http.Request) {
 	p.tokenCalls++
 	nonce := p.nonce
 	expectedVerifier := p.codeVerifier
+	tokenStatus := p.tokenStatus
+	tokenBody := p.tokenBody
+	idTokenOverride := p.idToken
 	p.mu.Unlock()
+	if tokenStatus != 0 && tokenStatus != http.StatusOK {
+		w.WriteHeader(tokenStatus)
+		_, _ = w.Write([]byte(tokenBody))
+		return
+	}
 	if r.Form.Get("code_verifier") != expectedVerifier {
 		http.Error(w, "invalid verifier", http.StatusBadRequest)
 		return
@@ -100,6 +114,9 @@ func (p *fakeProvider) serveToken(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, "sign token", http.StatusInternalServerError)
 		return
+	}
+	if idTokenOverride != "" {
+		idToken = idTokenOverride
 	}
 	writeTestJSON(w, map[string]any{
 		"access_token": "access-token",
@@ -369,6 +386,220 @@ func TestLogoutClearsSessionAndUsesDiscoveredEndpoint(t *testing.T) {
 	}
 	if len(response.Result().Cookies()) == 0 || response.Result().Cookies()[0].MaxAge >= 0 {
 		t.Fatalf("session cookie was not cleared: %#v", response.Result().Cookies())
+	}
+}
+
+func TestCallbackDoesNotExposeTokenEndpointResponseToLogsOrErrorHandler(t *testing.T) {
+	provider := newFakeProvider(t)
+	const sensitiveBody = `{"error":"invalid_client","client_secret":"do-not-leak"}`
+	provider.mu.Lock()
+	provider.tokenStatus = http.StatusUnauthorized
+	provider.tokenBody = sensitiveBody
+	provider.mu.Unlock()
+
+	var logs bytes.Buffer
+	var handledErr error
+	config := testConfig(provider)
+	config.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+	config.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, status int, _ string, err error) {
+		handledErr = err
+		w.WriteHeader(status)
+	}
+	authenticator, err := New(config)
+	if err != nil {
+		t.Fatalf("create authenticator: %v", err)
+	}
+
+	loginResponse := httptest.NewRecorder()
+	authenticator.LoginHandler(loginResponse, httptest.NewRequest(http.MethodGet, "/login", nil))
+	location, err := url.Parse(loginResponse.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse login redirect: %v", err)
+	}
+	cookie := loginResponse.Result().Cookies()[0]
+	value, err := decryptTransaction(authenticator.config.StateEncryptionKey, cookie.Value, time.Now())
+	if err != nil {
+		t.Fatalf("decrypt transaction: %v", err)
+	}
+	provider.mu.Lock()
+	provider.nonce = location.Query().Get("nonce")
+	provider.codeVerifier = value.CodeVerifier
+	provider.mu.Unlock()
+
+	callbackResponse := httptest.NewRecorder()
+	callbackRequest := httptest.NewRequest(http.MethodGet, "/callback?code=authorization-code&state="+url.QueryEscape(location.Query().Get("state")), nil)
+	callbackRequest.AddCookie(cookie)
+	authenticator.CallbackHandler(callbackResponse, callbackRequest)
+
+	if !errors.Is(handledErr, ErrAuthenticationFailed) {
+		t.Fatalf("ErrorHandler error = %v, want ErrAuthenticationFailed", handledErr)
+	}
+	if strings.Contains(logs.String(), sensitiveBody) || strings.Contains(logs.String(), "do-not-leak") {
+		t.Fatalf("logs exposed token response: %s", logs.String())
+	}
+	if strings.Contains(handledErr.Error(), "do-not-leak") {
+		t.Fatalf("ErrorHandler exposed token response: %v", handledErr)
+	}
+}
+
+func TestLoginDoesNotExposeDiscoveryResponseToLogsOrErrorHandler(t *testing.T) {
+	const sensitiveBody = `{"error":"server_error","debug":"discovery-secret"}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(sensitiveBody))
+	}))
+	t.Cleanup(server.Close)
+	provider := &fakeProvider{server: server}
+
+	var logs bytes.Buffer
+	var handledErr error
+	config := testConfig(provider)
+	config.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+	config.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, status int, _ string, err error) {
+		handledErr = err
+		w.WriteHeader(status)
+	}
+	authenticator, err := New(config)
+	if err != nil {
+		t.Fatalf("create authenticator: %v", err)
+	}
+
+	response := httptest.NewRecorder()
+	authenticator.LoginHandler(response, httptest.NewRequest(http.MethodGet, "/login", nil))
+
+	if !errors.Is(handledErr, ErrProviderUnavailable) {
+		t.Fatalf("ErrorHandler error = %v, want ErrProviderUnavailable", handledErr)
+	}
+	if strings.Contains(logs.String(), sensitiveBody) || strings.Contains(logs.String(), "discovery-secret") {
+		t.Fatalf("logs exposed discovery response: %s", logs.String())
+	}
+	if strings.Contains(handledErr.Error(), "discovery-secret") {
+		t.Fatalf("ErrorHandler exposed discovery response: %v", handledErr)
+	}
+}
+
+func TestCallbackDoesNotExposeInvalidIDTokenToLogsOrErrorHandler(t *testing.T) {
+	provider := newFakeProvider(t)
+	const sensitiveToken = "header.verification-secret.signature"
+	provider.mu.Lock()
+	provider.idToken = sensitiveToken
+	provider.mu.Unlock()
+
+	var logs bytes.Buffer
+	var handledErr error
+	config := testConfig(provider)
+	config.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+	config.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, status int, _ string, err error) {
+		handledErr = err
+		w.WriteHeader(status)
+	}
+	authenticator, err := New(config)
+	if err != nil {
+		t.Fatalf("create authenticator: %v", err)
+	}
+
+	loginResponse := httptest.NewRecorder()
+	authenticator.LoginHandler(loginResponse, httptest.NewRequest(http.MethodGet, "/login", nil))
+	location, err := url.Parse(loginResponse.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("parse login redirect: %v", err)
+	}
+	cookie := loginResponse.Result().Cookies()[0]
+	value, err := decryptTransaction(authenticator.config.StateEncryptionKey, cookie.Value, time.Now())
+	if err != nil {
+		t.Fatalf("decrypt transaction: %v", err)
+	}
+	provider.mu.Lock()
+	provider.nonce = location.Query().Get("nonce")
+	provider.codeVerifier = value.CodeVerifier
+	provider.mu.Unlock()
+
+	callbackResponse := httptest.NewRecorder()
+	callbackRequest := httptest.NewRequest(http.MethodGet, "/callback?code=authorization-code&state="+url.QueryEscape(location.Query().Get("state")), nil)
+	callbackRequest.AddCookie(cookie)
+	authenticator.CallbackHandler(callbackResponse, callbackRequest)
+
+	if !errors.Is(handledErr, ErrAuthenticationFailed) {
+		t.Fatalf("ErrorHandler error = %v, want ErrAuthenticationFailed", handledErr)
+	}
+	if strings.Contains(logs.String(), "verification-secret") || strings.Contains(handledErr.Error(), "verification-secret") {
+		t.Fatalf("invalid ID token escaped sanitization: logs=%q error=%v", logs.String(), handledErr)
+	}
+}
+
+func TestLogoutDoesNotExposeBuilderErrorToLogs(t *testing.T) {
+	provider := newFakeProvider(t)
+	const sensitiveError = "logout builder leaked private-token"
+	var logs bytes.Buffer
+	config := testConfig(provider)
+	config.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+	config.LogoutURLBuilder = func(LogoutRequest) (string, error) {
+		return "", errors.New(sensitiveError)
+	}
+	authenticator, err := New(config)
+	if err != nil {
+		t.Fatalf("create authenticator: %v", err)
+	}
+
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/logout", nil)
+	request.AddCookie(&http.Cookie{Name: "jwt", Value: "raw.id.token"})
+	authenticator.LogoutHandler(response, request)
+
+	if response.Code != http.StatusFound {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusFound)
+	}
+	if strings.Contains(logs.String(), sensitiveError) || strings.Contains(logs.String(), "private-token") {
+		t.Fatalf("logs exposed logout builder error: %s", logs.String())
+	}
+}
+
+func TestVerifyPreservesEmailNotVerifiedSentinel(t *testing.T) {
+	provider := newFakeProvider(t)
+	config := testConfig(provider)
+	config.RequireVerifiedEmail = true
+	authenticator, err := New(config)
+	if err != nil {
+		t.Fatalf("create authenticator: %v", err)
+	}
+	now := time.Now()
+	rawIDToken, err := provider.sign(map[string]any{
+		"iss":            provider.server.URL,
+		"sub":            "user-123",
+		"aud":            "client-123",
+		"exp":            now.Add(time.Hour).Unix(),
+		"iat":            now.Unix(),
+		"email":          "person@example.com",
+		"email_verified": false,
+	})
+	if err != nil {
+		t.Fatalf("sign token: %v", err)
+	}
+
+	_, err = authenticator.Verify(t.Context(), rawIDToken)
+	if !errors.Is(err, ErrEmailNotVerified) {
+		t.Fatalf("Verify error = %v, want ErrEmailNotVerified", err)
+	}
+}
+
+func TestErrorHandlerPreservesRecoverableTransactionErrorText(t *testing.T) {
+	provider := newFakeProvider(t)
+	var handledErr error
+	config := testConfig(provider)
+	config.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, status int, _ string, err error) {
+		handledErr = err
+		w.WriteHeader(status)
+	}
+	authenticator, err := New(config)
+	if err != nil {
+		t.Fatalf("create authenticator: %v", err)
+	}
+
+	response := httptest.NewRecorder()
+	authenticator.CallbackHandler(response, httptest.NewRequest(http.MethodGet, "/callback?code=code&state=state", nil))
+
+	if handledErr == nil || handledErr.Error() != "authentication transaction cookie is missing" {
+		t.Fatalf("ErrorHandler error = %v", handledErr)
 	}
 }
 
